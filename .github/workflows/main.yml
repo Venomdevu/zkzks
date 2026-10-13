@@ -1,0 +1,154 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Write-Host "Configurando Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "RDP configurado!"
+
+      - name: Create RDP User
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Configure o secret RDP_PASSWORD no GitHub."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePassword `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          Write-Host "Usuario RDP criado!"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Instalando Tailscale..."
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Falha na instalacao do Tailscale: $($process.ExitCode)"
+          }
+
+          Write-Host "Tailscale instalado!"
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Configure o secret TAILSCALE_AUTH_KEY."
+          }
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $tailscale up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao conectar ao Tailscale."
+          }
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 12; $i++) {
+            $ip = & $tailscale ip -4
+
+            if ($ip) {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ip) {
+            throw "Nao foi possivel obter o IP."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale conectado!"
+          Write-Host "IP: $ip"
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Verificando RDP..."
+
+          $service = Get-Service TermService
+
+          if ($service.Status -ne "Running") {
+            throw "Servico RDP nao esta funcionando."
+          }
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+            throw "Porta RDP 3389 indisponivel."
+          }
+
+          Write-Host "RDP funcionando!"
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "Usuario: RDP"
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host "============================"
+          Write-Host "       RDP ONLINE"
+          Write-Host "============================"
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "Usuario: RDP"
+          Write-Host "Senha: Secret RDP_PASSWORD"
+          Write-Host "============================"
+
+          while ($true) {
+            Write-Host "RDP ativo: $(Get-Date)"
+            Start-Sleep -Seconds 300
+          }
